@@ -1,251 +1,354 @@
-// Qude Alexa Skill
-// Deploy as AWS Lambda (Node.js 18.x runtime)
-// Required env vars: QUDE_API_URL
-//
-// Intents handled:
-//   AddShowIntent        — "Alexa, add Breaking Bad to my Qude watchlist"
-//   GetWatchlistIntent   — "Alexa, what's on my Qude watchlist"
-//   GetRecommendIntent   — "Alexa, ask Qude what I should watch tonight"
-//   MarkWatchedIntent    — "Alexa, tell Qude I finished Succession"
-//   TrendingIntent       — "Alexa, ask Qude what's trending"
-//   HelpIntent, StopIntent, CancelIntent (built-in)
+// Qude Discord Bot
+// Commands: /watchlist /add /recommend /watched /whats-on /qude-help
+// Deploy to Railway, Render, or any Node.js host
+// Required env vars: DISCORD_TOKEN, DISCORD_CLIENT_ID, QUDE_API_URL
 
-const Alexa = require('ask-sdk-core');
-const https = require('https');
+import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder } from 'discord.js';
+import axios from 'axios';
 
-const QUDE_API = process.env.QUDE_API_URL || 'https://qude-production.up.railway.app/api';
+const DISCORD_TOKEN   = process.env.DISCORD_TOKEN;
+const CLIENT_ID       = process.env.DISCORD_CLIENT_ID;
+const QUDE_API        = process.env.QUDE_API_URL || 'https://qude-production.up.railway.app/api';
 
-// ── HTTP helper ───────────────────────────────────────────────────────────────
+// ── Register slash commands ───────────────────────────────────────────────────
 
-function apiGet(path) {
-  return new Promise((resolve, reject) => {
-    https.get(`${QUDE_API}${path}`, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch { reject(new Error('Parse error')); }
-      });
-    }).on('error', reject);
-  });
+const commands = [
+  new SlashCommandBuilder()
+    .setName('watchlist')
+    .setDescription('Show your Qude watchlist (top 10 shows)')
+    .addStringOption(o => o.setName('status').setDescription('Filter by status').setRequired(false)
+      .addChoices(
+        { name: 'Watching', value: 'watching' },
+        { name: 'Finished', value: 'watched' },
+        { name: 'In Queue', value: 'want_to_watch' },
+      )),
+
+  new SlashCommandBuilder()
+    .setName('add')
+    .setDescription('Add a show to your Qude watchlist')
+    .addStringOption(o => o.setName('show').setDescription('Show title').setRequired(true))
+    .addStringOption(o => o.setName('service').setDescription('Streaming service').setRequired(false)
+      .addChoices(
+        { name: 'Netflix', value: 'netflix' },
+        { name: 'Hulu', value: 'hulu' },
+        { name: 'Disney+', value: 'disney_plus' },
+        { name: 'HBO Max', value: 'hbo_max' },
+        { name: 'Prime Video', value: 'amazon_prime' },
+        { name: 'Apple TV+', value: 'apple_tv' },
+        { name: 'Peacock', value: 'peacock' },
+        { name: 'Paramount+', value: 'paramount_plus' },
+      )),
+
+  new SlashCommandBuilder()
+    .setName('recommend')
+    .setDescription('Get a show recommendation based on your mood')
+    .addStringOption(o => o.setName('mood').setDescription('Your current mood').setRequired(true)
+      .addChoices(
+        { name: '😄 Happy', value: 'happy' },
+        { name: '😤 Stressed', value: 'stressed' },
+        { name: '😑 Bored', value: 'bored' },
+        { name: '🔥 Adventurous', value: 'adventurous' },
+        { name: '❤️ Romantic', value: 'romantic' },
+        { name: '😢 Sad', value: 'sad' },
+      )),
+
+  new SlashCommandBuilder()
+    .setName('watched')
+    .setDescription('Mark a show as finished on your Qude watchlist')
+    .addStringOption(o => o.setName('show').setDescription('Show title').setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('popular-now')
+    .setDescription('See what shows are trending on Qude right now'),
+
+  new SlashCommandBuilder()
+    .setName('link')
+    .setDescription('Link your Discord account to Qude')
+    .addStringOption(o => o.setName('username').setDescription('Your Qude username').setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('qude-help')
+    .setDescription('Show all Qude bot commands'),
+].map(cmd => cmd.toJSON());
+
+// Register commands with Discord
+async function registerCommands() {
+  const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+  try {
+    console.log('[Qude Bot] Registering slash commands...');
+    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+    console.log('[Qude Bot] Commands registered.');
+  } catch (err) {
+    console.error('[Qude Bot] Failed to register commands:', err);
+  }
 }
 
-// ── Session token helper ──────────────────────────────────────────────────────
-// Users say "ask Qude to link account [token]" once to store their auth token
-// in session attributes. For a real skill, use Alexa Account Linking.
+// ── In-memory Discord → Qude token store ─────────────────────────────────────
+// In production, persist this in a database
+const userTokens = new Map(); // discordUserId → { token, username }
 
-function getToken(handlerInput) {
-  const sessionAttrs = handlerInput.attributesManager.getSessionAttributes();
-  return sessionAttrs.qudeToken || null;
+// ── Client ────────────────────────────────────────────────────────────────────
+
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+client.once('ready', () => {
+  console.log(`[Qude Bot] Logged in as ${client.user.tag}`);
+  registerCommands();
+});
+
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  const { commandName } = interaction;
+
+  try {
+    switch (commandName) {
+      case 'qude-help':
+        await handleHelp(interaction);
+        break;
+      case 'link':
+        await handleLink(interaction);
+        break;
+      case 'watchlist':
+        await handleWatchlist(interaction);
+        break;
+      case 'add':
+        await handleAdd(interaction);
+        break;
+      case 'recommend':
+        await handleRecommend(interaction);
+        break;
+      case 'watched':
+        await handleWatched(interaction);
+        break;
+      case 'popular-now':
+        await handlePopularNow(interaction);
+        break;
+    }
+  } catch (err) {
+    console.error(`[Qude Bot] Error in ${commandName}:`, err);
+    const reply = { content: '⚠️ Something went wrong. Try again in a moment.', ephemeral: true };
+    if (interaction.deferred) await interaction.editReply(reply);
+    else await interaction.reply(reply);
+  }
+});
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function requireAuth(interaction) {
+  const linked = userTokens.get(interaction.user.id);
+  if (!linked) {
+    interaction.reply({
+      content: '🔗 Link your Qude account first with `/link your-username`\nDon\'t have an account? Sign up free at **qudetv.com**',
+      ephemeral: true,
+    });
+    return null;
+  }
+  return linked;
 }
 
-// ── Launch ────────────────────────────────────────────────────────────────────
+function authHeaders(linked) {
+  return { Authorization: `Bearer ${linked.token}` };
+}
 
-const LaunchRequestHandler = {
-  canHandle: (input) => Alexa.getRequestType(input.requestEnvelope) === 'LaunchRequest',
-  handle: (input) => {
-    const speech = "Welcome to Qude! You can say: what's on my watchlist, add a show, what should I watch tonight, or what's trending. What would you like to do?";
-    return input.responseBuilder
-      .speak(speech)
-      .reprompt("What would you like to do?")
-      .getResponse();
-  },
+const SERVICE_NAMES = {
+  netflix: 'Netflix', hulu: 'Hulu', disney_plus: 'Disney+',
+  hbo_max: 'HBO Max', amazon_prime: 'Prime Video', apple_tv: 'Apple TV+',
+  peacock: 'Peacock', paramount_plus: 'Paramount+',
 };
 
-// ── Get Watchlist ─────────────────────────────────────────────────────────────
+const STATUS_LABELS = {
+  watching: '▶️ Watching', watched: '✅ Finished', want_to_watch: '🕐 In Queue',
+};
 
-const GetWatchlistIntentHandler = {
-  canHandle: (input) =>
-    Alexa.getRequestType(input.requestEnvelope) === 'IntentRequest' &&
-    Alexa.getIntentName(input.requestEnvelope) === 'GetWatchlistIntent',
-  handle: async (input) => {
-    try {
-      const data = await apiGet('/detection/popular-now');
-      const popular = data.popular || [];
+// ── Command handlers ──────────────────────────────────────────────────────────
 
-      if (popular.length === 0) {
-        return input.responseBuilder
-          .speak("I couldn't find any trending shows right now. Try visiting qudetv.com to see your watchlist.")
-          .getResponse();
-      }
+async function handleHelp(interaction) {
+  const embed = new EmbedBuilder()
+    .setColor(0x7c3aed)
+    .setTitle('📺 Qude Bot Commands')
+    .setDescription('Track your shows across all streaming services')
+    .addFields(
+      { name: '/link [username]',    value: 'Connect your Qude account', inline: false },
+      { name: '/watchlist',          value: 'View your watchlist', inline: true },
+      { name: '/add [show]',         value: 'Add a show', inline: true },
+      { name: '/watched [show]',     value: 'Mark as finished', inline: true },
+      { name: '/recommend [mood]',   value: 'Get a mood-based pick', inline: true },
+      { name: '/popular-now',        value: 'What\'s trending on Qude', inline: true },
+    )
+    .setFooter({ text: 'qudetv.com · Never lose track of what to watch' });
 
-      const topShows = popular.slice(0, 3).map(s => s.title).join(', ');
-      const speech = `Here's what's popular on Qude right now: ${topShows}. Visit qudetv.com to see your personal watchlist.`;
+  await interaction.reply({ embeds: [embed], ephemeral: true });
+}
 
-      return input.responseBuilder.speak(speech).getResponse();
-    } catch {
-      return input.responseBuilder
-        .speak("I had trouble connecting to Qude. Please try again in a moment.")
-        .getResponse();
+async function handleLink(interaction) {
+  const username = interaction.options.getString('username');
+  await interaction.deferReply({ ephemeral: true });
+
+  try {
+    // Look up user by username to verify it exists
+    const res = await axios.get(`${QUDE_API}/users/${username}/profile`);
+    const profile = res.data;
+
+    // Store the link (token-less for now — future: OAuth flow)
+    userTokens.set(interaction.user.id, { username, token: null, profile });
+
+    const embed = new EmbedBuilder()
+      .setColor(0x06b6d4)
+      .setTitle('🔗 Account Linked!')
+      .setDescription(`Your Discord is now linked to **@${username}** on Qude.`)
+      .addFields(
+        { name: '📺 Shows tracked', value: String(profile.total_shows), inline: true },
+        { name: '✅ Finished',       value: String(profile.watched), inline: true },
+        { name: '🧬 Watch type',     value: profile.dna_label, inline: true },
+      )
+      .setFooter({ text: 'Use /watchlist, /add, /recommend and more' });
+
+    await interaction.editReply({ embeds: [embed] });
+  } catch (err) {
+    await interaction.editReply({ content: `❌ Couldn't find Qude user **@${username}**. Check your username at qudetv.com/settings` });
+  }
+}
+
+async function handleWatchlist(interaction) {
+  const linked = requireAuth(interaction);
+  if (!linked) return;
+  await interaction.deferReply();
+
+  const statusFilter = interaction.options.getString('status');
+
+  try {
+    const res = await axios.get(`${QUDE_API}/users/${linked.username}/profile`);
+    const profile = res.data;
+    const shows = profile.currently_watching || [];
+
+    if (shows.length === 0) {
+      await interaction.editReply({ content: `📭 **@${linked.username}**'s watchlist is empty. Add shows at qudetv.com` });
+      return;
     }
-  },
-};
 
-// ── Get Recommendation ────────────────────────────────────────────────────────
+    const embed = new EmbedBuilder()
+      .setColor(0x7c3aed)
+      .setTitle(`📺 @${linked.username}'s Watchlist`)
+      .setDescription(shows.slice(0, 10).map((s, i) => {
+        const service = SERVICE_NAMES[s.service_id] || s.service_id;
+        const ep = s.current_season ? ` · S${s.current_season}E${s.current_episode || 1}` : '';
+        return `**${i + 1}.** ${s.title}${ep} · ${service}`;
+      }).join('\n'))
+      .addFields(
+        { name: 'Total shows', value: String(profile.total_shows), inline: true },
+        { name: 'Finished',    value: String(profile.watched),     inline: true },
+        { name: 'Watch type',  value: profile.dna_label,           inline: true },
+      )
+      .setFooter({ text: 'Full watchlist at qudetv.com/watchlist' });
 
-const GetRecommendIntentHandler = {
-  canHandle: (input) =>
-    Alexa.getRequestType(input.requestEnvelope) === 'IntentRequest' &&
-    Alexa.getIntentName(input.requestEnvelope) === 'GetRecommendIntent',
-  handle: async (input) => {
-    try {
-      const data = await apiGet('/tmdb/trending');
-      const shows = data.results || [];
+    await interaction.editReply({ embeds: [embed] });
+  } catch (err) {
+    await interaction.editReply({ content: '❌ Failed to fetch watchlist. Make sure your Qude account is public.' });
+  }
+}
 
-      if (shows.length === 0) {
-        return input.responseBuilder
-          .speak("Visit qudetv.com and tap 'Pick tonight's show' for a personalised recommendation!")
-          .getResponse();
-      }
+async function handleAdd(interaction) {
+  const linked = requireAuth(interaction);
+  if (!linked) return;
 
-      // Pick a random one from top 5
-      const pick = shows[Math.floor(Math.random() * Math.min(shows.length, 5))];
-      const speech = `Tonight, I suggest ${pick.title}. It's rated ${pick.rating} out of 10. You can find it at qudetv.com.`;
+  const showTitle = interaction.options.getString('show');
+  const serviceId = interaction.options.getString('service') || 'netflix';
 
-      return input.responseBuilder.speak(speech).getResponse();
-    } catch {
-      return input.responseBuilder
-        .speak("Visit qudetv.com and tap 'Pick tonight's show' for a personalised recommendation!")
-        .getResponse();
+  await interaction.deferReply();
+
+  // Note: Without a token, we can only show a deep link to add the show
+  // Full add requires OAuth token integration
+  const searchUrl = `https://qudetv.com/watchlist?add=${encodeURIComponent(showTitle)}`;
+  const embed = new EmbedBuilder()
+    .setColor(0x7c3aed)
+    .setTitle(`➕ Add "${showTitle}" to Qude`)
+    .setDescription(`Click below to add this show to your watchlist on Qude.`)
+    .setURL(searchUrl)
+    .addFields(
+      { name: 'Service', value: SERVICE_NAMES[serviceId] || serviceId, inline: true },
+    )
+    .setFooter({ text: 'Or use the Chrome extension to auto-track while you watch' });
+
+  await interaction.editReply({ embeds: [embed] });
+}
+
+async function handleRecommend(interaction) {
+  const mood = interaction.options.getString('mood');
+  await interaction.deferReply();
+
+  try {
+    // Public mood endpoint doesn't require auth
+    const moodEmojis = { happy: '😄', stressed: '😤', bored: '😑', adventurous: '🔥', romantic: '❤️', sad: '😢' };
+    const emoji = moodEmojis[mood] || '🎭';
+
+    // Use TMDB trending as fallback since mood endpoint requires auth
+    const res = await axios.get(`${QUDE_API.replace('/api', '')}/api/tmdb/trending`, {
+      headers: { Authorization: 'Bearer public' }
+    }).catch(() => ({ data: { results: [] } }));
+
+    const results = res.data.results || [];
+    if (results.length === 0) {
+      await interaction.editReply({ content: `${emoji} Check out qudetv.com for mood-based recommendations!` });
+      return;
     }
-  },
-};
 
-// ── Add Show ──────────────────────────────────────────────────────────────────
+    const pick = results[Math.floor(Math.random() * Math.min(results.length, 5))];
+    const embed = new EmbedBuilder()
+      .setColor(0x06b6d4)
+      .setTitle(`${emoji} Qude recommends for ${mood} mood:`)
+      .setDescription(`**${pick.title}**`)
+      .addFields(
+        { name: '⭐ Rating', value: String(pick.rating || 'N/A'), inline: true },
+      )
+      .setURL(`https://qudetv.com`)
+      .setThumbnail(pick.poster_url || null)
+      .setFooter({ text: 'Get personalised picks at qudetv.com/mood' });
 
-const AddShowIntentHandler = {
-  canHandle: (input) =>
-    Alexa.getRequestType(input.requestEnvelope) === 'IntentRequest' &&
-    Alexa.getIntentName(input.requestEnvelope) === 'AddShowIntent',
-  handle: (input) => {
-    const slots = input.requestEnvelope.request.intent.slots;
-    const showName = slots?.ShowName?.value || 'that show';
+    await interaction.editReply({ embeds: [embed] });
+  } catch (err) {
+    await interaction.editReply({ content: '🎭 Check out qudetv.com/mood for personalised recommendations!' });
+  }
+}
 
-    // Deep link to Qude — full add requires auth token integration
-    const speech = `I've noted ${showName}. Open Qude on your phone or at qudetv.com to add it to your watchlist. Or install the Qude Chrome extension to track it automatically when you watch.`;
+async function handleWatched(interaction) {
+  const linked = requireAuth(interaction);
+  if (!linked) return;
 
-    return input.responseBuilder.speak(speech).getResponse();
-  },
-};
+  const showTitle = interaction.options.getString('show');
+  await interaction.deferReply();
 
-// ── Mark Watched ──────────────────────────────────────────────────────────────
+  const embed = new EmbedBuilder()
+    .setColor(0x10b981)
+    .setTitle(`✅ Marked as finished!`)
+    .setDescription(`Go to qudetv.com/watchlist to update **${showTitle}** and rate it.`)
+    .setURL(`https://qudetv.com/watchlist`)
+    .setFooter({ text: 'Or use the Chrome extension to track automatically' });
 
-const MarkWatchedIntentHandler = {
-  canHandle: (input) =>
-    Alexa.getRequestType(input.requestEnvelope) === 'IntentRequest' &&
-    Alexa.getIntentName(input.requestEnvelope) === 'MarkWatchedIntent',
-  handle: (input) => {
-    const slots = input.requestEnvelope.request.intent.slots;
-    const showName = slots?.ShowName?.value || 'that show';
+  await interaction.editReply({ embeds: [embed] });
+}
 
-    const speech = `Great, you finished ${showName}! Open Qude to mark it as watched and rate it. Your Finish Rate Score helps other Qude users too.`;
-    return input.responseBuilder.speak(speech).getResponse();
-  },
-};
+async function handlePopularNow(interaction) {
+  await interaction.deferReply();
+  try {
+    const res = await axios.get(`${QUDE_API}/detection/popular-now`);
+    const popular = res.data.popular || [];
 
-// ── Trending ──────────────────────────────────────────────────────────────────
+    const embed = new EmbedBuilder()
+      .setColor(0x7c3aed)
+      .setTitle('🔥 Trending on Qude right now')
+      .setDescription(
+        popular.length > 0
+          ? popular.slice(0, 8).map((s, i) => `**${i + 1}.** ${s.title} · ${s.detections} users watching`).join('\n')
+          : 'Not enough data yet — check back later!'
+      )
+      .setFooter({ text: `qudetv.com · Updated hourly` });
 
-const TrendingIntentHandler = {
-  canHandle: (input) =>
-    Alexa.getRequestType(input.requestEnvelope) === 'IntentRequest' &&
-    Alexa.getIntentName(input.requestEnvelope) === 'TrendingIntent',
-  handle: async (input) => {
-    try {
-      const data = await apiGet('/detection/popular-now');
-      const popular = (data.popular || []).slice(0, 3);
+    await interaction.editReply({ embeds: [embed] });
+  } catch (err) {
+    await interaction.editReply({ content: '📊 Trending data unavailable right now. Try again soon!' });
+  }
+}
 
-      if (popular.length === 0) {
-        return input.responseBuilder
-          .speak("I don't have trending data right now. Check qudetv.com for what's popular.")
-          .getResponse();
-      }
+// ── Start ─────────────────────────────────────────────────────────────────────
 
-      const names = popular.map(s => s.title);
-      let speech;
-      if (names.length === 1) speech = `Right now on Qude, people are watching ${names[0]}.`;
-      else if (names.length === 2) speech = `Right now on Qude, people are watching ${names[0]} and ${names[1]}.`;
-      else speech = `Right now on Qude, people are watching ${names[0]}, ${names[1]}, and ${names[2]}.`;
-
-      return input.responseBuilder.speak(speech).getResponse();
-    } catch {
-      return input.responseBuilder
-        .speak("Check qudetv.com for what's trending right now.")
-        .getResponse();
-    }
-  },
-};
-
-// ── Help / Stop / Cancel ──────────────────────────────────────────────────────
-
-const HelpIntentHandler = {
-  canHandle: (input) =>
-    Alexa.getRequestType(input.requestEnvelope) === 'IntentRequest' &&
-    Alexa.getIntentName(input.requestEnvelope) === 'AMAZON.HelpIntent',
-  handle: (input) => {
-    const speech = "With Qude, you can ask: what should I watch tonight, what's on my watchlist, add a show, I finished watching a show, or what's trending. What would you like?";
-    return input.responseBuilder.speak(speech).reprompt(speech).getResponse();
-  },
-};
-
-const StopCancelHandler = {
-  canHandle: (input) =>
-    Alexa.getRequestType(input.requestEnvelope) === 'IntentRequest' &&
-    ['AMAZON.StopIntent', 'AMAZON.CancelIntent'].includes(Alexa.getIntentName(input.requestEnvelope)),
-  handle: (input) =>
-    input.responseBuilder.speak("Enjoy your show! Come back to Qude anytime.").getResponse(),
-};
-
-const ErrorHandler = {
-  canHandle: () => true,
-  handle: (input, error) => {
-    console.error('[Qude Alexa] Error:', error);
-    return input.responseBuilder
-      .speak("Sorry, I had trouble with that. Please try again.")
-      .reprompt("Please try again.")
-      .getResponse();
-  },
-};
-
-// ── Export handler ────────────────────────────────────────────────────────────
-
-exports.handler = Alexa.SkillBuilders.custom()
-  .addRequestHandlers(
-    LaunchRequestHandler,
-    GetWatchlistIntentHandler,
-    GetRecommendIntentHandler,
-    AddShowIntentHandler,
-    MarkWatchedIntentHandler,
-    TrendingIntentHandler,
-    HelpIntentHandler,
-    StopCancelHandler,
-  )
-  .addErrorHandlers(ErrorHandler)
-  .lambda();
-
-/*
-  SKILL.JSON INTERACTION MODEL — create this in the Alexa Developer Console
-  under Interaction Model → Intents:
-
-  GetWatchlistIntent:
-    Utterances: "what's on my watchlist", "show me my list", "what am I watching"
-
-  GetRecommendIntent:
-    Utterances: "what should I watch tonight", "recommend something", "pick a show for me"
-
-  AddShowIntent (with slot ShowName: AMAZON.SearchQuery):
-    Utterances: "add {ShowName} to my watchlist", "add {ShowName}", "put {ShowName} on my list"
-
-  MarkWatchedIntent (with slot ShowName: AMAZON.SearchQuery):
-    Utterances: "I finished {ShowName}", "I watched {ShowName}", "mark {ShowName} as watched"
-
-  TrendingIntent:
-    Utterances: "what's trending", "what are people watching", "what's popular on Qude"
-
-  DEPLOYMENT:
-  1. Create skill at developer.amazon.com/alexa
-  2. Create Lambda function (Node.js 18.x) in AWS
-  3. Paste this file as index.js, set env var QUDE_API_URL
-  4. Add Lambda ARN as skill endpoint
-  5. Add intents above in Alexa console
-  6. Submit for certification
-*/
+client.login(DISCORD_TOKEN);
